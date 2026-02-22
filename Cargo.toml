@@ -1,0 +1,38 @@
+[package]
+name = "nu_plugin_bigquery"
+version = "0.1.0"
+edition = "2024"
+description = "A Nushell plugin for querying Google BigQuery"
+license = "MIT"
+
+[[bin]]
+name = "nu_plugin_bigquery"
+path = "src/main.rs"
+
+[dependencies]
+nu-plugin = "0.110.0"
+nu-protocol = "0.110.0"
+
+# Auth & HTTP
+gcp_auth = "0.12"
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# Date/time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Base64 for BYTES type
+base64 = "0.22"
+
+# Arrow IPC output (--arrow flag)
+arrow = { version = "54", features = ["ipc"] }
+tempfile = "3"
+
+# Pin interprocess to avoid API breakage with nu-plugin-core 0.110.0
+interprocess = "=2.2.2"
