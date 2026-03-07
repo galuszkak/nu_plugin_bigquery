@@ -1,8 +1,6 @@
 #![allow(dead_code)] // API response fields are deserialized from JSON; not all are read directly
 
-use std::sync::Arc;
-
-use gcp_auth::TokenProvider;
+use google_cloud_auth::credentials::AccessTokenCredentials;
 use nu_protocol::LabeledError;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -14,12 +12,12 @@ const BQ_BASE_URL: &str = "https://bigquery.googleapis.com/bigquery/v2";
 /// BigQuery REST API client.
 pub struct BigQueryClient {
     http: Client,
-    provider: Arc<dyn TokenProvider>,
+    provider: AccessTokenCredentials,
     project: String,
 }
 
 impl BigQueryClient {
-    pub fn new(provider: Arc<dyn TokenProvider>, project: String) -> Self {
+    pub fn new(provider: AccessTokenCredentials, project: String) -> Self {
         let http = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
             .timeout(std::time::Duration::from_secs(300))
@@ -37,7 +35,7 @@ impl BigQueryClient {
     }
 
     async fn bearer_token(&self) -> Result<String, LabeledError> {
-        auth::get_token(self.provider.as_ref()).await
+        auth::get_token(&self.provider).await
     }
 
     /// Execute a SQL query and return the full response including schema.

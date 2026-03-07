@@ -12,9 +12,6 @@ path = "src/main.rs"
 [dependencies]
 nu-plugin = "0.110.0"
 nu-protocol = "0.110.0"
-
-# Auth & HTTP
-gcp_auth = "0.12"
 reqwest = { version = "0.12", features = ["json"] }
 
 # Serialization
@@ -36,3 +33,4 @@ tempfile = "3"
 
 # Pin interprocess to avoid API breakage with nu-plugin-core 0.110.0
 interprocess = "=2.2.2"
+google-cloud-auth = "1.6.0"

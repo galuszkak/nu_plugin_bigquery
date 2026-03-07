@@ -51,7 +51,7 @@ pub(crate) fn create_client(
     plugin.runtime.block_on(async {
         let provider = auth::resolve_auth(credentials.as_deref(), engine).await?;
         let project_id =
-            auth::resolve_project(project.as_deref(), engine, provider.as_ref(), span).await?;
+            auth::resolve_project(project.as_deref(), engine, credentials.as_deref(), span).await?;
         Ok(BigQueryClient::new(provider, project_id))
     })
 }
