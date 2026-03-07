@@ -61,19 +61,9 @@ async fn load_credentials_from_file(path: &str) -> Result<AccessTokenCredentials
         ))
     })?;
 
-    // We can't use Builder::default() for an explicit file, we must determine its type
-    // and use the appropriate builder, or we can temporarily set the env var
-    // and use Builder::default(). However, setting env vars in multi-threaded
-    // environments is unsafe. Instead, we can use the `google_cloud_auth` builders directly.
-    // Wait, google_cloud_auth provides `google_cloud_auth::credentials::extract_credential_type`
-    // but building them manually for all types is tedious.
-
-    // Fortunately, `google_cloud_auth`'s `Builder::default()` doesn't allow passing a JSON directly,
-    // but the sub-builders (like `service_account::Builder`) do. Let's write the JSON to a temporary file
-    // and use it? No, we can just use `std::env::set_var` safely here? NO, `set_var` is unsound in multi-threaded contexts.
-
-    // Since `extract_credential_type` is pub(crate), we can't use it.
-    // Let's implement our own extraction logic to find the type and use the right builder.
+    // Determine the credential type directly from the JSON.
+    // `google_cloud_auth` doesn't expose a generic builder that accepts a JSON object,
+    // so we manually delegate to the appropriate sub-builder (e.g., service_account, authorized_user).
     let type_str = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     let credentials = match type_str {
@@ -188,6 +178,7 @@ fn extract_project_id_from_credentials(
         p?
     };
 
+    #[allow(clippy::collapsible_if)]
     if let Ok(contents) = std::fs::read_to_string(&path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
             // Service accounts and some others have `project_id`.
