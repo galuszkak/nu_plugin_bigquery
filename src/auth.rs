@@ -50,9 +50,8 @@ async fn load_credentials_from_file(path: &str) -> Result<AccessTokenCredentials
     }
 
     let contents = std::fs::read_to_string(path).map_err(|e| {
-        LabeledError::new("Failed to read credentials file").with_help(format!(
-            "Could not read file at '{path}': {e}"
-        ))
+        LabeledError::new("Failed to read credentials file")
+            .with_help(format!("Could not read file at '{path}': {e}"))
     })?;
 
     let json: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
@@ -78,42 +77,34 @@ async fn load_credentials_from_file(path: &str) -> Result<AccessTokenCredentials
     let type_str = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     let credentials = match type_str {
-        "service_account" => {
-            google_cloud_auth::credentials::service_account::Builder::new(json)
-                .with_access_specifier(google_cloud_auth::credentials::service_account::AccessSpecifier::from_scopes(BQ_SCOPES))
-                .build_access_token_credentials()
-                .map_err(|e| {
-                    LabeledError::new("Failed to build credentials").with_help(format!(
-                        "Could not build credentials from '{path}': {e}"
-                    ))
-                })
-        }
-        "external_account" => {
-            google_cloud_auth::credentials::external_account::Builder::new(json)
-                .with_scopes(BQ_SCOPES)
-                .build_access_token_credentials()
-                .map_err(|e| {
-                    LabeledError::new("Failed to build credentials").with_help(format!(
-                        "Could not build credentials from '{path}': {e}"
-                    ))
-                })
-        }
+        "service_account" => google_cloud_auth::credentials::service_account::Builder::new(json)
+            .with_access_specifier(
+                google_cloud_auth::credentials::service_account::AccessSpecifier::from_scopes(
+                    BQ_SCOPES,
+                ),
+            )
+            .build_access_token_credentials()
+            .map_err(|e| {
+                LabeledError::new("Failed to build credentials")
+                    .with_help(format!("Could not build credentials from '{path}': {e}"))
+            }),
+        "external_account" => google_cloud_auth::credentials::external_account::Builder::new(json)
+            .with_scopes(BQ_SCOPES)
+            .build_access_token_credentials()
+            .map_err(|e| {
+                LabeledError::new("Failed to build credentials")
+                    .with_help(format!("Could not build credentials from '{path}': {e}"))
+            }),
         // Application default credentials often have type "authorized_user" for user accounts
-        "authorized_user" => {
-            google_cloud_auth::credentials::user_account::Builder::new(json)
-                .with_scopes(BQ_SCOPES)
-                .build_access_token_credentials()
-                .map_err(|e| {
-                    LabeledError::new("Failed to build credentials").with_help(format!(
-                        "Could not build credentials from '{path}': {e}"
-                    ))
-                })
-        }
-        _ => {
-            Err(LabeledError::new("Failed to build credentials").with_help(format!(
-                "Unsupported credential type: {}", type_str
-            )))
-        }
+        "authorized_user" => google_cloud_auth::credentials::user_account::Builder::new(json)
+            .with_scopes(BQ_SCOPES)
+            .build_access_token_credentials()
+            .map_err(|e| {
+                LabeledError::new("Failed to build credentials")
+                    .with_help(format!("Could not build credentials from '{path}': {e}"))
+            }),
+        _ => Err(LabeledError::new("Failed to build credentials")
+            .with_help(format!("Unsupported credential type: {}", type_str))),
     }?;
 
     Ok(credentials)
@@ -190,9 +181,9 @@ fn extract_project_id_from_credentials(
             .map(|root| PathBuf::from(root).join("gcloud/application_default_credentials.json"));
 
         #[cfg(not(target_os = "windows"))]
-        let p = std::env::var("HOME")
-            .ok()
-            .map(|root| PathBuf::from(root).join(".config/gcloud/application_default_credentials.json"));
+        let p = std::env::var("HOME").ok().map(|root| {
+            PathBuf::from(root).join(".config/gcloud/application_default_credentials.json")
+        });
 
         p?
     };
