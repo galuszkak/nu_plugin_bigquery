@@ -1,6 +1,6 @@
 [package]
 name = "nu_plugin_bigquery"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A Nushell plugin for querying Google BigQuery"
 license = "MIT"
