@@ -312,9 +312,9 @@ mod tests {
 
     #[test]
     fn test_convert_float_from_string() {
-        let val = serde_json::Value::String("3.14".to_string());
+        let val = serde_json::Value::String("3.5".to_string());
         let result = convert_float(&val, Span::test_data());
-        assert_eq!(result, Value::test_float(3.14));
+        assert_eq!(result, Value::test_float(3.5));
     }
 
     #[test]

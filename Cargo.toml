@@ -10,8 +10,8 @@ name = "nu_plugin_bigquery"
 path = "src/main.rs"
 
 [dependencies]
-nu-plugin = "0.110.0"
-nu-protocol = "0.110.0"
+nu-plugin = "0.111.0"
+nu-protocol = "0.111.0"
 reqwest = { version = "0.12", features = ["json"] }
 
 # Serialization
@@ -31,6 +31,5 @@ base64 = "0.22"
 arrow = { version = "54", features = ["ipc"] }
 tempfile = "3"
 
-# Pin interprocess to avoid API breakage with nu-plugin-core 0.110.0
-interprocess = "=2.2.2"
+interprocess = "2.4.0"
 google-cloud-auth = "1.6.0"
