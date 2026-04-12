@@ -1,6 +1,6 @@
 [package]
 name = "nu_plugin_bigquery"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A Nushell plugin for querying Google BigQuery"
 license = "MIT"
@@ -10,9 +10,9 @@ name = "nu_plugin_bigquery"
 path = "src/main.rs"
 
 [dependencies]
-nu-plugin = "0.111.0"
-nu-protocol = "0.111.0"
-reqwest = { version = "0.12", features = ["json"] }
+nu-plugin = "0.112.1"
+nu-protocol = "0.112.1"
+reqwest = { version = "0.13", features = ["json", "query"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -28,8 +28,8 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 
 # Arrow IPC output (--arrow flag)
-arrow = { version = "54", features = ["ipc"] }
+arrow = { version = "58", features = ["ipc"] }
 tempfile = "3"
 
 interprocess = "2.4.0"
-google-cloud-auth = "1.6.0"
+google-cloud-auth = "1.8.0"
