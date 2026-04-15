@@ -6,3 +6,4 @@ mod convert;
 mod plugin;
 
 pub use plugin::BigQueryPlugin;
+pub mod grpc_client;

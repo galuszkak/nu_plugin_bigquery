@@ -33,3 +33,6 @@ tempfile = "3"
 
 interprocess = "2.4.0"
 google-cloud-auth = "1.8.0"
+tonic = { version = "0.14.5", features = ["tls-webpki-roots"] }
+prost = "0.14.3"
+googleapis-tonic-google-cloud-bigquery-storage-v1 = "0.31.0"

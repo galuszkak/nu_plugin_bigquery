@@ -472,3 +472,10 @@ struct BqApiErrorDetail {
     reason: Option<String>,
     message: Option<String>,
 }
+
+impl BigQueryClient {
+    pub async fn create_storage_client(&self) -> Result<crate::grpc_client::StorageClient, LabeledError> {
+        let token = self.bearer_token().await?;
+        crate::grpc_client::create_storage_client(token).await
+    }
+}
