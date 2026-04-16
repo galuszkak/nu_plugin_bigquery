@@ -1,6 +1,6 @@
+use arrow::array::*;
 use std::sync::Arc;
 
-use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
@@ -550,8 +550,6 @@ fn arrow_batch_to_nu_values(
     batch: &arrow::record_batch::RecordBatch,
     span: nu_protocol::Span,
 ) -> Result<Vec<nu_protocol::Value>, nu_protocol::LabeledError> {
-    use arrow::array::*;
-
     let num_rows = batch.num_rows();
     let num_cols = batch.num_columns();
     let schema = batch.schema();
@@ -597,7 +595,6 @@ fn arrow_value_to_nu(
     data_type: &arrow::datatypes::DataType,
     span: nu_protocol::Span,
 ) -> nu_protocol::Value {
-    use arrow::array::*;
     use arrow::datatypes::DataType;
 
     if col.is_null(row_idx) {
@@ -1095,5 +1092,163 @@ mod tests {
         assert_eq!(city_col.value(0), "Springfield");
 
         std::fs::remove_file(&path).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests_arrow_to_nu {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use nu_protocol::{Span, Value};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_arrow_batch_to_nu_values_primitives() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("int_col", DataType::Int64, true),
+            Field::new("float_col", DataType::Float64, true),
+            Field::new("bool_col", DataType::Boolean, true),
+            Field::new("str_col", DataType::Utf8, true),
+        ]));
+
+        let int_arr = Int64Array::from(vec![Some(42), None, Some(-10)]);
+        let float_arr = Float64Array::from(vec![Some(9.99), Some(-2.5), None]);
+        let bool_arr = BooleanArray::from(vec![None, Some(true), Some(false)]);
+        let str_arr = StringArray::from(vec![Some("hello"), Some("world"), None]);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(int_arr),
+                Arc::new(float_arr),
+                Arc::new(bool_arr),
+                Arc::new(str_arr),
+            ],
+        )
+        .unwrap();
+
+        let span = Span::test_data();
+        let result = arrow_batch_to_nu_values(&batch, span).unwrap();
+        assert_eq!(result.len(), 3);
+
+        // Row 0
+        let row0 = result[0].as_record().unwrap();
+        assert_eq!(row0.get("int_col").unwrap(), &Value::int(42, span));
+        assert_eq!(row0.get("float_col").unwrap(), &Value::float(9.99, span));
+        assert_eq!(row0.get("bool_col").unwrap(), &Value::nothing(span));
+        assert_eq!(row0.get("str_col").unwrap(), &Value::string("hello", span));
+
+        // Row 1
+        let row1 = result[1].as_record().unwrap();
+        assert_eq!(row1.get("int_col").unwrap(), &Value::nothing(span));
+        assert_eq!(row1.get("float_col").unwrap(), &Value::float(-2.5, span));
+        assert_eq!(row1.get("bool_col").unwrap(), &Value::bool(true, span));
+        assert_eq!(row1.get("str_col").unwrap(), &Value::string("world", span));
+
+        // Row 2
+        let row2 = result[2].as_record().unwrap();
+        assert_eq!(row2.get("int_col").unwrap(), &Value::int(-10, span));
+        assert_eq!(row2.get("float_col").unwrap(), &Value::nothing(span));
+        assert_eq!(row2.get("bool_col").unwrap(), &Value::bool(false, span));
+        assert_eq!(row2.get("str_col").unwrap(), &Value::nothing(span));
+    }
+
+    #[test]
+    fn test_arrow_batch_to_nu_values_datetime() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("date_col", DataType::Date32, true),
+            Field::new(
+                "ts_col",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+
+        // Date32: days since epoch. 1970-01-02 is 1 day.
+        let date_arr = Date32Array::from(vec![Some(1), None]);
+
+        // Timestamp(us): microseconds since epoch. 1 second is 1_000_000 microseconds.
+        let ts_arr = TimestampMicrosecondArray::from(vec![None, Some(1_000_000)]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(date_arr), Arc::new(ts_arr)]).unwrap();
+
+        let span = Span::test_data();
+        let result = arrow_batch_to_nu_values(&batch, span).unwrap();
+        assert_eq!(result.len(), 2);
+
+        // Row 0
+        let row0 = result[0].as_record().unwrap();
+        match row0.get("date_col").unwrap() {
+            Value::Date { val, .. } => {
+                assert_eq!(val.format("%Y-%m-%d").to_string(), "1970-01-02");
+            }
+            _ => panic!("Expected Date value"),
+        }
+        assert_eq!(row0.get("ts_col").unwrap(), &Value::nothing(span));
+
+        // Row 1
+        let row1 = result[1].as_record().unwrap();
+        assert_eq!(row1.get("date_col").unwrap(), &Value::nothing(span));
+        match row1.get("ts_col").unwrap() {
+            Value::Date { val, .. } => {
+                assert_eq!(
+                    val.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    "1970-01-01 00:00:01"
+                );
+            }
+            _ => panic!("Expected Date value"),
+        }
+    }
+
+    #[test]
+    fn test_arrow_batch_to_nu_values_nested() {
+        use arrow::datatypes::Fields;
+
+        let inner_fields = vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "list_col",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
+            Field::new(
+                "struct_col",
+                DataType::Struct(Fields::from(inner_fields.clone())),
+                true,
+            ),
+        ]));
+
+        let mut list_builder = ListBuilder::new(Int64Builder::new());
+        list_builder.values().append_value(1);
+        list_builder.values().append_value(2);
+        list_builder.append(true);
+        list_builder.append(false);
+        let list_arr = list_builder.finish();
+
+        let a_arr = Arc::new(Int64Array::from(vec![Some(100), Some(200)])) as Arc<dyn Array>;
+        let b_arr = Arc::new(StringArray::from(vec![Some("x"), Some("y")])) as Arc<dyn Array>;
+        let struct_arr =
+            StructArray::try_new(Fields::from(inner_fields), vec![a_arr, b_arr], None).unwrap();
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(list_arr), Arc::new(struct_arr)]).unwrap();
+
+        let span = Span::test_data();
+        let result = arrow_batch_to_nu_values(&batch, span).unwrap();
+        assert_eq!(result.len(), 2);
+
+        let row0 = result[0].as_record().unwrap();
+        let list_val = row0.get("list_col").unwrap().as_list().unwrap();
+        assert_eq!(list_val, &[Value::int(1, span), Value::int(2, span)]);
+
+        let struct_val = row0.get("struct_col").unwrap().as_record().unwrap();
+        assert_eq!(struct_val.get("a").unwrap(), &Value::int(100, span));
+        assert_eq!(struct_val.get("b").unwrap(), &Value::string("x", span));
     }
 }

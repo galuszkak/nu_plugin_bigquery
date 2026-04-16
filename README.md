@@ -86,6 +86,8 @@ bq read my_dataset.clickstream --arrow | polars open $in | polars collect
 
 Table reference formats: `dataset.table` or `project.dataset.table`
 
+> **Note:** `bq read` utilizes the gRPC-based BigQuery Storage API, which provides significantly faster data transfer speeds, native Arrow IPC streaming, and lower overhead compared to traditional SQL queries.
+
 ### `bq datasets` — List datasets
 
 ```nushell
