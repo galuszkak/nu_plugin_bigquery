@@ -8,26 +8,31 @@ pub struct AuthInterceptor {
 }
 
 impl Interceptor for AuthInterceptor {
-    fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        request.metadata_mut().insert("authorization", self.token_metadata.clone());
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        request
+            .metadata_mut()
+            .insert("authorization", self.token_metadata.clone());
         Ok(request)
     }
 }
 
-pub type StorageClient = BigQueryReadClient<tonic::codegen::InterceptedService<Channel, AuthInterceptor>>;
+pub type StorageClient =
+    BigQueryReadClient<tonic::codegen::InterceptedService<Channel, AuthInterceptor>>;
 
-pub async fn create_storage_client(
-    token: String,
-) -> Result<StorageClient, LabeledError> {
-    let tls_config = ClientTlsConfig::new()
-        .with_enabled_roots(); // tonic requires tls-webpki-roots
+pub async fn create_storage_client(token: String) -> Result<StorageClient, LabeledError> {
+    let tls_config = ClientTlsConfig::new().with_enabled_roots(); // tonic requires tls-webpki-roots
 
     let channel = Channel::from_static("https://bigquerystorage.googleapis.com")
         .tls_config(tls_config)
         .map_err(|e| LabeledError::new(format!("Failed to setup TLS: {}", e)))?
         .connect()
         .await
-        .map_err(|e| LabeledError::new(format!("Failed to connect to BigQuery Storage API: {}", e)))?;
+        .map_err(|e| {
+            LabeledError::new(format!("Failed to connect to BigQuery Storage API: {}", e))
+        })?;
 
     let token_header = format!("Bearer {}", token);
     let token_metadata = MetadataValue::try_from(token_header)

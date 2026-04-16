@@ -449,8 +449,6 @@ fn json_to_datetime_us(v: &serde_json::Value) -> Option<i64> {
     None
 }
 
-
-
 pub fn decode_storage_api_arrow(
     schema_bytes: Vec<u8>,
     batch_bytes: Vec<Vec<u8>>,
@@ -481,8 +479,7 @@ pub fn decode_storage_api_arrow(
                 .with_help(e.to_string())
         })?;
         let (file, path) = temp_file.keep().map_err(|e| {
-            nu_protocol::LabeledError::new("Failed to keep temporary file")
-                .with_help(e.to_string())
+            nu_protocol::LabeledError::new("Failed to keep temporary file").with_help(e.to_string())
         })?;
 
         let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema).map_err(|e| {
@@ -493,7 +490,8 @@ pub fn decode_storage_api_arrow(
         let mut total_written = 0;
         for batch_res in reader.by_ref() {
             let mut batch = batch_res.map_err(|e| {
-                nu_protocol::LabeledError::new("Failed to read Arrow batch").with_help(e.to_string())
+                nu_protocol::LabeledError::new("Failed to read Arrow batch")
+                    .with_help(e.to_string())
             })?;
 
             if let Some(limit) = max_results {
@@ -508,20 +506,26 @@ pub fn decode_storage_api_arrow(
             }
 
             writer.write(&batch).map_err(|e| {
-                nu_protocol::LabeledError::new("Failed to write Arrow batch").with_help(e.to_string())
+                nu_protocol::LabeledError::new("Failed to write Arrow batch")
+                    .with_help(e.to_string())
             })?;
 
             total_written += batch.num_rows();
             if let Some(limit) = max_results
-                && total_written >= limit as usize {
-                    break;
-                }
+                && total_written >= limit as usize
+            {
+                break;
+            }
         }
         writer.finish().map_err(|e| {
-            nu_protocol::LabeledError::new("Failed to finish Arrow IPC file").with_help(e.to_string())
+            nu_protocol::LabeledError::new("Failed to finish Arrow IPC file")
+                .with_help(e.to_string())
         })?;
 
-        return Ok(nu_protocol::Value::string(path.to_string_lossy().to_string(), span));
+        return Ok(nu_protocol::Value::string(
+            path.to_string_lossy().to_string(),
+            span,
+        ));
     }
 
     // Normal mode: Convert Arrow RecordBatch back into Nushell Values
@@ -561,7 +565,7 @@ fn arrow_batch_to_nu_values(
         let field = schema.field(c);
 
         #[allow(clippy::needless_range_loop)]
-    for r in 0..num_rows {
+        for r in 0..num_rows {
             if col.is_null(r) {
                 cols_vals[c].push(nu_protocol::Value::nothing(span));
                 continue;
@@ -578,7 +582,7 @@ fn arrow_batch_to_nu_values(
     for r in 0..num_rows {
         let mut row_record = nu_protocol::Record::with_capacity(num_cols);
         #[allow(clippy::needless_range_loop)]
-    for c in 0..num_cols {
+        for c in 0..num_cols {
             row_record.push(col_names[c].clone(), cols_vals[c][r].clone());
         }
         rows.push(nu_protocol::Value::record(row_record, span));
@@ -664,7 +668,10 @@ fn arrow_value_to_nu(
             }
         }
         DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _) => {
-            let arr = col.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+            let arr = col
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
             let micros = arr.value(row_idx);
             let seconds = micros / 1_000_000;
             let nanos = (micros % 1_000_000) * 1000;
@@ -679,7 +686,12 @@ fn arrow_value_to_nu(
             let values_arr = list_arr.value(row_idx);
             let mut items = Vec::with_capacity(values_arr.len());
             for i in 0..values_arr.len() {
-                items.push(arrow_value_to_nu(values_arr.as_ref(), i, field.data_type(), span));
+                items.push(arrow_value_to_nu(
+                    values_arr.as_ref(),
+                    i,
+                    field.data_type(),
+                    span,
+                ));
             }
             nu_protocol::Value::list(items, span)
         }
@@ -688,7 +700,12 @@ fn arrow_value_to_nu(
             let values_arr = list_arr.value(row_idx);
             let mut items = Vec::with_capacity(values_arr.len());
             for i in 0..values_arr.len() {
-                items.push(arrow_value_to_nu(values_arr.as_ref(), i, field.data_type(), span));
+                items.push(arrow_value_to_nu(
+                    values_arr.as_ref(),
+                    i,
+                    field.data_type(),
+                    span,
+                ));
             }
             nu_protocol::Value::list(items, span)
         }
@@ -696,7 +713,12 @@ fn arrow_value_to_nu(
             let struct_arr = col.as_any().downcast_ref::<StructArray>().unwrap();
             let mut record = nu_protocol::Record::with_capacity(fields.len());
             for (i, field) in fields.iter().enumerate() {
-                let val = arrow_value_to_nu(struct_arr.column(i).as_ref(), row_idx, field.data_type(), span);
+                let val = arrow_value_to_nu(
+                    struct_arr.column(i).as_ref(),
+                    row_idx,
+                    field.data_type(),
+                    span,
+                );
                 record.push(field.name().clone(), val);
             }
             nu_protocol::Value::record(record, span)
@@ -723,7 +745,6 @@ fn arrow_value_to_nu(
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
