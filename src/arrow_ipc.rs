@@ -1,4 +1,5 @@
 use arrow::array::*;
+use arrow::datatypes::SchemaRef;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -449,104 +450,75 @@ fn json_to_datetime_us(v: &serde_json::Value) -> Option<i64> {
     None
 }
 
-pub fn decode_storage_api_arrow(
-    schema_bytes: Vec<u8>,
-    batch_bytes: Vec<Vec<u8>>,
-    arrow_mode: bool,
-    max_results: Option<i64>,
-    span: nu_protocol::Span,
-) -> Result<nu_protocol::Value, nu_protocol::LabeledError> {
-    use arrow::ipc::reader::StreamReader;
-    use std::io::Cursor;
-
-    let mut combined_bytes = Vec::new();
-    combined_bytes.extend_from_slice(&schema_bytes);
-    for batch in batch_bytes {
-        combined_bytes.extend_from_slice(&batch);
-    }
-
-    let cursor = Cursor::new(combined_bytes);
-    let mut reader = StreamReader::try_new(cursor, None).map_err(|e| {
-        nu_protocol::LabeledError::new("Failed to parse Arrow stream").with_help(e.to_string())
-    })?;
-
-    let schema = reader.schema();
-
-    if arrow_mode {
-        use tempfile::NamedTempFile;
-        let temp_file = NamedTempFile::new().map_err(|e| {
-            nu_protocol::LabeledError::new("Failed to create temporary file")
-                .with_help(e.to_string())
-        })?;
-        let (file, path) = temp_file.keep().map_err(|e| {
-            nu_protocol::LabeledError::new("Failed to keep temporary file").with_help(e.to_string())
-        })?;
-
-        let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema).map_err(|e| {
-            nu_protocol::LabeledError::new("Failed to create Arrow IPC writer")
-                .with_help(e.to_string())
-        })?;
-
-        let mut total_written = 0;
-        for batch_res in reader.by_ref() {
-            let mut batch = batch_res.map_err(|e| {
-                nu_protocol::LabeledError::new("Failed to read Arrow batch")
-                    .with_help(e.to_string())
-            })?;
-
-            if let Some(limit) = max_results {
-                let limit_usize = limit as usize;
-                if total_written + batch.num_rows() > limit_usize {
-                    let take_rows = limit_usize - total_written;
-                    if take_rows == 0 {
-                        break;
-                    }
-                    batch = batch.slice(0, take_rows);
-                }
-            }
-
-            writer.write(&batch).map_err(|e| {
-                nu_protocol::LabeledError::new("Failed to write Arrow batch")
-                    .with_help(e.to_string())
-            })?;
-
-            total_written += batch.num_rows();
-            if let Some(limit) = max_results
-                && total_written >= limit as usize
-            {
-                break;
-            }
-        }
-        writer.finish().map_err(|e| {
-            nu_protocol::LabeledError::new("Failed to finish Arrow IPC file")
-                .with_help(e.to_string())
-        })?;
-
-        return Ok(nu_protocol::Value::string(
-            path.to_string_lossy().to_string(),
-            span,
-        ));
-    }
-
-    // Normal mode: Convert Arrow RecordBatch back into Nushell Values
-    let mut values = Vec::new();
-    for batch_res in reader {
-        let batch = batch_res.map_err(|e| {
-            nu_protocol::LabeledError::new("Failed to read Arrow batch").with_help(e.to_string())
-        })?;
-
-        let mut row_values = arrow_batch_to_nu_values(&batch, span)?;
-        values.append(&mut row_values);
-    }
-
-    if let Some(limit) = max_results {
-        values.truncate(limit as usize);
-    }
-
-    Ok(nu_protocol::Value::list(values, span))
+pub(crate) struct StorageArrowDecoder {
+    decoder: arrow::ipc::reader::StreamDecoder,
+    schema: SchemaRef,
 }
 
-fn arrow_batch_to_nu_values(
+impl StorageArrowDecoder {
+    pub(crate) fn new(schema_bytes: Vec<u8>) -> Result<Self, nu_protocol::LabeledError> {
+        let reader = arrow::ipc::reader::StreamReader::try_new(
+            std::io::Cursor::new(schema_bytes.clone()),
+            None,
+        )
+        .map_err(storage_arrow_error)?;
+        let schema = reader.schema();
+
+        let mut decoder = arrow::ipc::reader::StreamDecoder::new();
+        let mut buffer = arrow::buffer::Buffer::from(schema_bytes);
+        let _ = decoder.decode(&mut buffer).map_err(storage_arrow_error)?;
+
+        Ok(Self { decoder, schema })
+    }
+
+    pub(crate) fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    pub(crate) fn decode_batch(
+        &mut self,
+        batch_bytes: Vec<u8>,
+    ) -> Result<Vec<RecordBatch>, nu_protocol::LabeledError> {
+        let mut buffer = arrow::buffer::Buffer::from(batch_bytes);
+        let mut batches = Vec::new();
+
+        while !buffer.is_empty() {
+            if let Some(batch) = self
+                .decoder
+                .decode(&mut buffer)
+                .map_err(storage_arrow_error)?
+            {
+                batches.push(batch);
+            }
+        }
+
+        Ok(batches)
+    }
+}
+
+fn storage_arrow_error(e: arrow::error::ArrowError) -> nu_protocol::LabeledError {
+    nu_protocol::LabeledError::new("Failed to decode Arrow IPC from BigQuery Storage")
+        .with_help(e.to_string())
+}
+
+pub(crate) fn create_arrow_ipc_file_writer(
+    schema: &Schema,
+) -> Result<(FileWriter<std::fs::File>, std::path::PathBuf), nu_protocol::LabeledError> {
+    let temp_file = NamedTempFile::with_suffix(".arrow").map_err(|e| {
+        nu_protocol::LabeledError::new("Failed to create temporary file").with_help(e.to_string())
+    })?;
+    let (file, path) = temp_file.keep().map_err(|e| {
+        nu_protocol::LabeledError::new("Failed to keep temporary file").with_help(e.to_string())
+    })?;
+
+    let writer = FileWriter::try_new(file, schema).map_err(|e| {
+        nu_protocol::LabeledError::new("Failed to create Arrow IPC writer").with_help(e.to_string())
+    })?;
+
+    Ok((writer, path))
+}
+
+pub(crate) fn arrow_batch_to_nu_values(
     batch: &arrow::record_batch::RecordBatch,
     span: nu_protocol::Span,
 ) -> Result<Vec<nu_protocol::Value>, nu_protocol::LabeledError> {
@@ -589,6 +561,18 @@ fn arrow_batch_to_nu_values(
     Ok(rows)
 }
 
+fn downcast_or_fallback<A: arrow::array::Array + 'static>(
+    col: &dyn arrow::array::Array,
+    row_idx: usize,
+    span: nu_protocol::Span,
+    f: impl FnOnce(&A, usize) -> nu_protocol::Value,
+) -> nu_protocol::Value {
+    col.as_any()
+        .downcast_ref::<A>()
+        .map(|arr| f(arr, row_idx))
+        .unwrap_or_else(|| nu_protocol::Value::string(format!("{:?}", col.data_type()), span))
+}
+
 fn arrow_value_to_nu(
     col: &dyn arrow::array::Array,
     row_idx: usize,
@@ -602,131 +586,113 @@ fn arrow_value_to_nu(
     }
 
     match data_type {
-        DataType::Int8 => {
-            let arr = col.as_any().downcast_ref::<Int8Array>().unwrap();
-            nu_protocol::Value::int(arr.value(row_idx) as i64, span)
-        }
-        DataType::Int16 => {
-            let arr = col.as_any().downcast_ref::<Int16Array>().unwrap();
-            nu_protocol::Value::int(arr.value(row_idx) as i64, span)
-        }
-        DataType::Int32 => {
-            let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-            nu_protocol::Value::int(arr.value(row_idx) as i64, span)
-        }
-        DataType::Int64 => {
-            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-            nu_protocol::Value::int(arr.value(row_idx), span)
-        }
-        DataType::UInt8 => {
-            let arr = col.as_any().downcast_ref::<UInt8Array>().unwrap();
-            nu_protocol::Value::int(arr.value(row_idx) as i64, span)
-        }
-        DataType::UInt16 => {
-            let arr = col.as_any().downcast_ref::<UInt16Array>().unwrap();
-            nu_protocol::Value::int(arr.value(row_idx) as i64, span)
-        }
-        DataType::UInt32 => {
-            let arr = col.as_any().downcast_ref::<UInt32Array>().unwrap();
-            nu_protocol::Value::int(arr.value(row_idx) as i64, span)
-        }
-        DataType::UInt64 => {
-            let arr = col.as_any().downcast_ref::<UInt64Array>().unwrap();
-            nu_protocol::Value::int(arr.value(row_idx) as i64, span)
-        }
-        DataType::Float32 => {
-            let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
-            nu_protocol::Value::float(arr.value(row_idx) as f64, span)
-        }
-        DataType::Float64 => {
-            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-            nu_protocol::Value::float(arr.value(row_idx), span)
-        }
-        DataType::Boolean => {
-            let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
-            nu_protocol::Value::bool(arr.value(row_idx), span)
-        }
-        DataType::Utf8 => {
-            let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-            nu_protocol::Value::string(arr.value(row_idx).to_string(), span)
-        }
+        DataType::Int8 => downcast_or_fallback::<Int8Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::Int16 => downcast_or_fallback::<Int16Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::Int32 => downcast_or_fallback::<Int32Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::Int64 => downcast_or_fallback::<Int64Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i), span)
+        }),
+        DataType::UInt8 => downcast_or_fallback::<UInt8Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::UInt16 => downcast_or_fallback::<UInt16Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::UInt32 => downcast_or_fallback::<UInt32Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::UInt64 => downcast_or_fallback::<UInt64Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::Float32 => downcast_or_fallback::<Float32Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::float(arr.value(i) as f64, span)
+        }),
+        DataType::Float64 => downcast_or_fallback::<Float64Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::float(arr.value(i), span)
+        }),
+        DataType::Boolean => downcast_or_fallback::<BooleanArray>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::bool(arr.value(i), span)
+        }),
+        DataType::Utf8 => downcast_or_fallback::<StringArray>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::string(arr.value(i).to_string(), span)
+        }),
         DataType::LargeUtf8 => {
-            let arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            nu_protocol::Value::string(arr.value(row_idx).to_string(), span)
+            downcast_or_fallback::<LargeStringArray>(col, row_idx, span, |arr, i| {
+                nu_protocol::Value::string(arr.value(i).to_string(), span)
+            })
         }
-        DataType::Date32 => {
-            let arr = col.as_any().downcast_ref::<Date32Array>().unwrap();
-            let days = arr.value(row_idx) as i64;
+        DataType::Date32 => downcast_or_fallback::<Date32Array>(col, row_idx, span, |arr, i| {
+            let days = arr.value(i) as i64;
             let seconds = days * 86400;
             if let Some(dt) = chrono::DateTime::from_timestamp(seconds, 0) {
                 nu_protocol::Value::date(dt.into(), span)
             } else {
                 nu_protocol::Value::string(format!("Date32({})", days), span)
             }
-        }
+        }),
         DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _) => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
-            let micros = arr.value(row_idx);
-            let seconds = micros / 1_000_000;
-            let nanos = (micros % 1_000_000) * 1000;
-            if let Some(dt) = chrono::DateTime::from_timestamp(seconds, nanos as u32) {
-                nu_protocol::Value::date(dt.into(), span)
-            } else {
-                nu_protocol::Value::string(format!("Timestamp(us, {})", micros), span)
-            }
+            downcast_or_fallback::<TimestampMicrosecondArray>(col, row_idx, span, |arr, i| {
+                let micros = arr.value(i);
+                let seconds = micros / 1_000_000;
+                let nanos = (micros % 1_000_000) * 1000;
+                if let Some(dt) = chrono::DateTime::from_timestamp(seconds, nanos as u32) {
+                    nu_protocol::Value::date(dt.into(), span)
+                } else {
+                    nu_protocol::Value::string(format!("Timestamp(us, {})", micros), span)
+                }
+            })
         }
-        DataType::List(field) => {
-            let list_arr = col.as_any().downcast_ref::<ListArray>().unwrap();
-            let values_arr = list_arr.value(row_idx);
+        DataType::List(field) => downcast_or_fallback::<ListArray>(col, row_idx, span, |arr, i| {
+            let values_arr = arr.value(i);
             let mut items = Vec::with_capacity(values_arr.len());
-            for i in 0..values_arr.len() {
+            for j in 0..values_arr.len() {
                 items.push(arrow_value_to_nu(
                     values_arr.as_ref(),
-                    i,
+                    j,
                     field.data_type(),
                     span,
                 ));
             }
             nu_protocol::Value::list(items, span)
-        }
+        }),
         DataType::LargeList(field) => {
-            let list_arr = col.as_any().downcast_ref::<LargeListArray>().unwrap();
-            let values_arr = list_arr.value(row_idx);
-            let mut items = Vec::with_capacity(values_arr.len());
-            for i in 0..values_arr.len() {
-                items.push(arrow_value_to_nu(
-                    values_arr.as_ref(),
-                    i,
-                    field.data_type(),
-                    span,
-                ));
-            }
-            nu_protocol::Value::list(items, span)
+            downcast_or_fallback::<LargeListArray>(col, row_idx, span, |arr, i| {
+                let values_arr = arr.value(i);
+                let mut items = Vec::with_capacity(values_arr.len());
+                for j in 0..values_arr.len() {
+                    items.push(arrow_value_to_nu(
+                        values_arr.as_ref(),
+                        j,
+                        field.data_type(),
+                        span,
+                    ));
+                }
+                nu_protocol::Value::list(items, span)
+            })
         }
         DataType::Struct(fields) => {
-            let struct_arr = col.as_any().downcast_ref::<StructArray>().unwrap();
-            let mut record = nu_protocol::Record::with_capacity(fields.len());
-            for (i, field) in fields.iter().enumerate() {
-                let val = arrow_value_to_nu(
-                    struct_arr.column(i).as_ref(),
-                    row_idx,
-                    field.data_type(),
-                    span,
-                );
-                record.push(field.name().clone(), val);
-            }
-            nu_protocol::Value::record(record, span)
+            downcast_or_fallback::<StructArray>(col, row_idx, span, |arr, i| {
+                let mut record = nu_protocol::Record::with_capacity(fields.len());
+                for (j, field) in fields.iter().enumerate() {
+                    let val = arrow_value_to_nu(arr.column(j).as_ref(), i, field.data_type(), span);
+                    record.push(field.name().clone(), val);
+                }
+                nu_protocol::Value::record(record, span)
+            })
         }
-        DataType::Binary => {
-            let arr = col.as_any().downcast_ref::<BinaryArray>().unwrap();
-            nu_protocol::Value::binary(arr.value(row_idx).to_vec(), span)
-        }
+        DataType::Binary => downcast_or_fallback::<BinaryArray>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::binary(arr.value(i).to_vec(), span)
+        }),
         DataType::LargeBinary => {
-            let arr = col.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-            nu_protocol::Value::binary(arr.value(row_idx).to_vec(), span)
+            downcast_or_fallback::<LargeBinaryArray>(col, row_idx, span, |arr, i| {
+                nu_protocol::Value::binary(arr.value(i).to_vec(), span)
+            })
         }
         // Fallback: cast to string
         _ => {
@@ -1250,5 +1216,62 @@ mod tests_arrow_to_nu {
         let struct_val = row0.get("struct_col").unwrap().as_record().unwrap();
         assert_eq!(struct_val.get("a").unwrap(), &Value::int(100, span));
         assert_eq!(struct_val.get("b").unwrap(), &Value::string("x", span));
+    }
+
+    #[test]
+    fn test_storage_arrow_decoder_reads_split_schema_and_batch_messages() {
+        use arrow::ipc::writer::{
+            CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap();
+
+        let options = IpcWriteOptions::default();
+        let mut dictionary_tracker = DictionaryTracker::new(false);
+        let data_gen = IpcDataGenerator::default();
+
+        let schema_message = data_gen.schema_to_bytes_with_dictionary_tracker(
+            schema.as_ref(),
+            &mut dictionary_tracker,
+            &options,
+        );
+        let mut schema_bytes = Vec::new();
+        write_message(&mut schema_bytes, schema_message, &options).unwrap();
+
+        let (_dictionaries, batch_message) = data_gen
+            .encode(
+                &batch,
+                &mut dictionary_tracker,
+                &options,
+                &mut CompressionContext::default(),
+            )
+            .unwrap();
+        let mut batch_bytes = Vec::new();
+        write_message(&mut batch_bytes, batch_message, &options).unwrap();
+
+        let mut decoder = StorageArrowDecoder::new(schema_bytes).unwrap();
+        let decoded = decoder.decode_batch(batch_bytes).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].num_rows(), 2);
+        assert_eq!(decoded[0].schema().field(0).name(), "id");
+    }
+
+    #[test]
+    fn test_create_arrow_ipc_file_writer_allows_empty_file() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let (mut writer, path) = create_arrow_ipc_file_writer(&schema).unwrap();
+        writer.finish().unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let mut reader = arrow::ipc::reader::FileReader::try_new(file, None).unwrap();
+
+        assert_eq!(reader.schema().field(0).name(), "id");
+        assert!(reader.next().is_none());
+
+        std::fs::remove_file(&path).ok();
     }
 }

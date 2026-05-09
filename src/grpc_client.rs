@@ -23,7 +23,7 @@ pub type StorageClient =
     BigQueryReadClient<tonic::codegen::InterceptedService<Channel, AuthInterceptor>>;
 
 pub async fn create_storage_client(token: String) -> Result<StorageClient, LabeledError> {
-    let tls_config = ClientTlsConfig::new().with_enabled_roots(); // tonic requires tls-webpki-roots
+    let tls_config = ClientTlsConfig::new().with_enabled_roots();
 
     let channel = Channel::from_static("https://bigquerystorage.googleapis.com")
         .tls_config(tls_config)

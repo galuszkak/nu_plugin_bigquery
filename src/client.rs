@@ -187,55 +187,6 @@ impl BigQueryClient {
         })
     }
 
-    /// Read rows from a table using tabledata.list API.
-    pub async fn read_table_data(
-        &self,
-        dataset_id: &str,
-        table_id: &str,
-        selected_fields: Option<&str>,
-        page_token: Option<&str>,
-        max_results: Option<u64>,
-    ) -> Result<TableDataListResponse, LabeledError> {
-        let token = self.bearer_token().await?;
-        let url = format!(
-            "{}/projects/{}/datasets/{}/tables/{}/data",
-            BQ_BASE_URL, self.project, dataset_id, table_id
-        );
-
-        let mut params: Vec<(&str, String)> = Vec::new();
-        if let Some(fields) = selected_fields {
-            params.push(("selectedFields", fields.to_string()));
-        }
-        if let Some(pt) = page_token {
-            params.push(("pageToken", pt.to_string()));
-        }
-        if let Some(mr) = max_results {
-            params.push(("maxResults", mr.to_string()));
-        }
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .query(&params)
-            .send()
-            .await
-            .map_err(|e| {
-                LabeledError::new("BigQuery request failed").with_help(format!("HTTP error: {e}"))
-            })?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(parse_bq_error(status.as_u16(), &body));
-        }
-
-        resp.json::<TableDataListResponse>().await.map_err(|e| {
-            LabeledError::new("Failed to parse BigQuery response")
-                .with_help(format!("JSON parse error: {e}"))
-        })
-    }
-
     /// Get table metadata (including schema).
     pub async fn get_table(
         &self,
@@ -370,16 +321,6 @@ pub struct JobReference {
     pub project_id: Option<String>,
     pub job_id: Option<String>,
     pub location: Option<String>,
-}
-
-// --- Table data list types (tabledata.list) ---
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct TableDataListResponse {
-    pub total_rows: Option<String>,
-    pub page_token: Option<String>,
-    pub rows: Option<Vec<TableRow>>,
 }
 
 // --- Dataset list types ---

@@ -13,12 +13,13 @@ A [Nushell](https://www.nushell.sh/) plugin for querying Google BigQuery directl
 
 ## Requirements
 
-- Nushell 0.110.0+
+- Nushell 0.112.2+
 - Rust toolchain (to build from source)
 - Google Cloud credentials (one of):
   - `gcloud auth application-default login` (recommended for development)
   - Service account key JSON file
   - GCE metadata server (on Google Cloud VMs)
+- BigQuery Storage Read permissions for `bq read` (for example, `roles/bigquery.readSessionUser` plus access to the table data)
 
 ## Installation
 

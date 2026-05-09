@@ -159,12 +159,17 @@ fn run_read(
 
         // 1. Create a ReadSession
         use googleapis_tonic_google_cloud_bigquery_storage_v1::google::cloud::bigquery::storage::v1::{
-            CreateReadSessionRequest, ReadSession, DataFormat, read_session::TableReadOptions,
-            ReadRowsRequest
+            read_rows_response::Rows, read_session::TableReadOptions, CreateReadSessionRequest,
+            DataFormat, ReadRowsRequest, ReadSession,
         };
 
         let parent = format!("projects/{}", client.project());
-        let table = format!("projects/{}/datasets/{}/tables/{}", client.project(), dataset_id, table_id);
+        let table = format!(
+            "projects/{}/datasets/{}/tables/{}",
+            client.project(),
+            dataset_id,
+            table_id
+        );
 
         let mut read_options = TableReadOptions::default();
         if let Some(ref cols) = columns {
@@ -184,7 +189,7 @@ fn run_read(
         let create_req = CreateReadSessionRequest {
             parent: parent.clone(),
             read_session: Some(session),
-            max_stream_count: 1, // Start with single stream for simplicity
+            max_stream_count: if max_results.is_some() { 1 } else { 0 },
             ..Default::default()
         };
 
@@ -197,53 +202,120 @@ fn run_read(
             })?
             .into_inner();
 
-        let streams = session_resp.streams;
-        if streams.is_empty() {
-            return Ok(Value::list(vec![], span));
-        }
-
-        // 2. ReadRows from the stream
-        let stream_name = streams[0].name.clone();
-        let read_rows_req = ReadRowsRequest {
-            read_stream: stream_name,
-            offset: 0,
-        };
-
-        let mut row_stream = storage_client
-            .read_rows(tonic::Request::new(read_rows_req))
-            .await
-            .map_err(|e| {
-                LabeledError::new("Failed to read rows from BigQuery Storage")
-                    .with_help(format!("gRPC error: {}", e))
-            })?
-            .into_inner();
-
-        // 3. Collect and process Arrow IPC data
-        let mut all_arrow_batches = Vec::new();
-        // Since the schema is embedded in the first read rows response or ReadSession,
-        // we can extract it from `session_resp.arrow_schema`
         let arrow_schema_bytes = match session_resp.schema {
             Some(googleapis_tonic_google_cloud_bigquery_storage_v1::google::cloud::bigquery::storage::v1::read_session::Schema::ArrowSchema(schema)) => schema.serialized_schema,
             _ => return Err(LabeledError::new("Expected Arrow schema from BigQuery Storage API")),
         };
+        let mut arrow_decoder = crate::arrow_ipc::StorageArrowDecoder::new(arrow_schema_bytes)?;
+        let streams = session_resp.streams;
+        let max_rows = max_results.map(|n| n as usize);
 
-        let mut total_rows = 0;
-        while let Some(resp) = row_stream.message().await.map_err(|e| {
-            LabeledError::new("Error reading from stream").with_help(format!("gRPC error: {}", e))
-        })? {
-            if let Some(googleapis_tonic_google_cloud_bigquery_storage_v1::google::cloud::bigquery::storage::v1::read_rows_response::Rows::ArrowRecordBatch(batch)) = resp.rows {
-                let row_count = resp.row_count;
-                if let Some(max) = max_results
-                    && total_rows >= max {
-                        break;
+        // 2. ReadRows stream-by-stream, decoding each Arrow batch as it arrives.
+        let read_timeout = std::time::Duration::from_secs(300);
+
+        if arrow_mode {
+            let schema = arrow_decoder.schema();
+            let (mut writer, path) = crate::arrow_ipc::create_arrow_ipc_file_writer(schema.as_ref())?;
+            let mut total_written = 0usize;
+
+            'streams: for stream in streams {
+                if max_rows.is_some_and(|max| total_written >= max) {
+                    break;
+                }
+
+                let mut req = tonic::Request::new(ReadRowsRequest {
+                    read_stream: stream.name,
+                    offset: 0,
+                });
+                req.set_timeout(read_timeout);
+
+                let mut row_stream = storage_client
+                    .read_rows(req)
+                    .await
+                    .map_err(|e| {
+                        LabeledError::new("Failed to read rows from BigQuery Storage")
+                            .with_help(format!("gRPC error: {}", e))
+                    })?
+                    .into_inner();
+
+                while let Some(resp) = row_stream.message().await.map_err(|e| {
+                    LabeledError::new("Failed to read rows from BigQuery Storage")
+                        .with_help(format!("gRPC stream error: {}", e))
+                })? {
+                    if let Some(Rows::ArrowRecordBatch(batch)) = resp.rows {
+                        for mut record_batch in arrow_decoder.decode_batch(batch.serialized_record_batch)? {
+                            if let Some(max) = max_rows {
+                                if total_written >= max {
+                                    break 'streams;
+                                }
+                                if total_written + record_batch.num_rows() > max {
+                                    record_batch = record_batch.slice(0, max - total_written);
+                                }
+                            }
+
+                            writer.write(&record_batch).map_err(|e| {
+                                LabeledError::new("Failed to write Arrow batch")
+                                    .with_help(e.to_string())
+                            })?;
+
+                            total_written += record_batch.num_rows();
+                        }
                     }
-                all_arrow_batches.push(batch.serialized_record_batch);
-                total_rows += row_count;
+                }
+            }
+
+            writer.finish().map_err(|e| {
+                LabeledError::new("Failed to finish Arrow IPC file").with_help(e.to_string())
+            })?;
+
+            return Ok(Value::string(path.to_string_lossy().to_string(), span));
+        }
+
+        let mut values = Vec::new();
+        'streams: for stream in streams {
+            if max_rows.is_some_and(|max| values.len() >= max) {
+                break;
+            }
+
+            let mut req = tonic::Request::new(ReadRowsRequest {
+                read_stream: stream.name,
+                offset: 0,
+            });
+            req.set_timeout(read_timeout);
+
+            let mut row_stream = storage_client
+                .read_rows(req)
+                .await
+                .map_err(|e| {
+                    LabeledError::new("Failed to read rows from BigQuery Storage")
+                        .with_help(format!("gRPC error: {}", e))
+                })?
+                .into_inner();
+
+            while let Some(resp) = row_stream.message().await.map_err(|e| {
+                LabeledError::new("Failed to read rows from BigQuery Storage")
+                    .with_help(format!("gRPC stream error: {}", e))
+            })? {
+                if let Some(Rows::ArrowRecordBatch(batch)) = resp.rows {
+                    for mut record_batch in arrow_decoder.decode_batch(batch.serialized_record_batch)? {
+                        if let Some(max) = max_rows {
+                            if values.len() >= max {
+                                break 'streams;
+                            }
+                            if values.len() + record_batch.num_rows() > max {
+                                record_batch = record_batch.slice(0, max - values.len());
+                            }
+                        }
+
+                        let mut row_values =
+                            crate::arrow_ipc::arrow_batch_to_nu_values(&record_batch, span)?;
+                        values.append(&mut row_values);
+                    }
+                }
             }
         }
 
-        // Decode Arrow IPC messages
-        crate::arrow_ipc::decode_storage_api_arrow(arrow_schema_bytes, all_arrow_batches, arrow_mode, max_results, span)
+        Ok(Value::list(values, span))
     })
 }
 
