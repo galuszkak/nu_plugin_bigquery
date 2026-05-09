@@ -1,8 +1,6 @@
 use nu_plugin::{EngineInterface, EvaluatedCall, SimplePluginCommand};
 use nu_protocol::{Category, LabeledError, Signature, SyntaxShape, Type, Value};
 
-use crate::arrow_ipc;
-use crate::convert;
 use crate::plugin::BigQueryPlugin;
 
 use super::{create_client, parse_table_ref};
@@ -157,155 +155,168 @@ fn run_read(
     let client = create_client(plugin, engine, credentials, effective_project, span)?;
 
     plugin.runtime.block_on(async {
-        // When --filter is specified, we need to use a SQL query since
-        // the tabledata.list REST API doesn't support row filtering.
-        if filter.is_some() {
-            return run_read_via_query(ReadQueryParams {
-                client: &client,
-                dataset_id: &dataset_id,
-                table_id: &table_id,
-                columns: columns.as_deref(),
-                filter: filter.as_deref(),
-                max_results,
-                arrow_mode,
-                span,
-            })
-            .await;
-        }
+        let mut storage_client = client.create_storage_client().await?;
 
-        // No filter — use tabledata.list API for direct table reads
-        let selected_fields = columns.as_ref().map(|cols| cols.join(","));
-
-        // Get the table schema for type conversion
-        let table_meta = client.get_table(&dataset_id, &table_id).await?;
-        let full_schema = table_meta.schema.ok_or_else(|| {
-            LabeledError::new("No schema found for table").with_help(format!(
-                "Table {dataset_id}.{table_id} has no schema information."
-            ))
-        })?;
-
-        // Filter schema to selected columns if specified
-        let schema = if let Some(ref sel) = selected_fields {
-            let selected: Vec<&str> = sel.split(',').collect();
-            let filtered_fields = full_schema
-                .fields
-                .as_ref()
-                .map(|fields| {
-                    fields
-                        .iter()
-                        .filter(|f| {
-                            f.name
-                                .as_deref()
-                                .map(|n| selected.contains(&n))
-                                .unwrap_or(false)
-                        })
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            crate::client::TableSchema {
-                fields: Some(filtered_fields),
-            }
-        } else {
-            full_schema
+        // 1. Create a ReadSession
+        use googleapis_tonic_google_cloud_bigquery_storage_v1::google::cloud::bigquery::storage::v1::{
+            read_rows_response::Rows, read_session::TableReadOptions, CreateReadSessionRequest,
+            DataFormat, ReadRowsRequest, ReadSession,
         };
 
-        // Read table data with pagination
-        let mut all_raw_rows = Vec::new();
-        let mut page_token: Option<String> = None;
-        let max = max_results.map(|n| n as u64);
+        let parent = format!("projects/{}", client.project());
+        let table = format!(
+            "projects/{}/datasets/{}/tables/{}",
+            client.project(),
+            dataset_id,
+            table_id
+        );
 
-        loop {
-            let response = client
-                .read_table_data(
-                    &dataset_id,
-                    &table_id,
-                    selected_fields.as_deref(),
-                    page_token.as_deref(),
-                    max,
-                )
-                .await?;
+        let mut read_options = TableReadOptions::default();
+        if let Some(ref cols) = columns {
+            read_options.selected_fields = cols.clone();
+        }
+        if let Some(ref f) = filter {
+            read_options.row_restriction = f.clone();
+        }
 
-            all_raw_rows.extend(response.rows.unwrap_or_default());
+        let session = ReadSession {
+            table: table.clone(),
+            data_format: DataFormat::Arrow.into(),
+            read_options: Some(read_options),
+            ..Default::default()
+        };
 
-            // Stop if we've hit the requested max
-            if let Some(limit) = max_results
-                && all_raw_rows.len() >= limit as usize
-            {
-                all_raw_rows.truncate(limit as usize);
+        let create_req = CreateReadSessionRequest {
+            parent: parent.clone(),
+            read_session: Some(session),
+            max_stream_count: if max_results.is_some() { 1 } else { 0 },
+            ..Default::default()
+        };
+
+        let session_resp = storage_client
+            .create_read_session(tonic::Request::new(create_req))
+            .await
+            .map_err(|e| {
+                LabeledError::new("Failed to create BigQuery Read Session")
+                    .with_help(format!("gRPC error: {}", e))
+            })?
+            .into_inner();
+
+        let arrow_schema_bytes = match session_resp.schema {
+            Some(googleapis_tonic_google_cloud_bigquery_storage_v1::google::cloud::bigquery::storage::v1::read_session::Schema::ArrowSchema(schema)) => schema.serialized_schema,
+            _ => return Err(LabeledError::new("Expected Arrow schema from BigQuery Storage API")),
+        };
+        let mut arrow_decoder = crate::arrow_ipc::StorageArrowDecoder::new(arrow_schema_bytes)?;
+        let streams = session_resp.streams;
+        let max_rows = max_results.map(|n| n as usize);
+
+        // 2. ReadRows stream-by-stream, decoding each Arrow batch as it arrives.
+        let read_timeout = std::time::Duration::from_secs(300);
+
+        if arrow_mode {
+            let schema = arrow_decoder.schema();
+            let (mut writer, path) = crate::arrow_ipc::create_arrow_ipc_file_writer(schema.as_ref())?;
+            let mut total_written = 0usize;
+
+            'streams: for stream in streams {
+                if max_rows.is_some_and(|max| total_written >= max) {
+                    break;
+                }
+
+                let mut req = tonic::Request::new(ReadRowsRequest {
+                    read_stream: stream.name,
+                    offset: 0,
+                });
+                req.set_timeout(read_timeout);
+
+                let mut row_stream = storage_client
+                    .read_rows(req)
+                    .await
+                    .map_err(|e| {
+                        LabeledError::new("Failed to read rows from BigQuery Storage")
+                            .with_help(format!("gRPC error: {}", e))
+                    })?
+                    .into_inner();
+
+                while let Some(resp) = row_stream.message().await.map_err(|e| {
+                    LabeledError::new("Failed to read rows from BigQuery Storage")
+                        .with_help(format!("gRPC stream error: {}", e))
+                })? {
+                    if let Some(Rows::ArrowRecordBatch(batch)) = resp.rows {
+                        for mut record_batch in arrow_decoder.decode_batch(batch.serialized_record_batch)? {
+                            if let Some(max) = max_rows {
+                                if total_written >= max {
+                                    break 'streams;
+                                }
+                                if total_written + record_batch.num_rows() > max {
+                                    record_batch = record_batch.slice(0, max - total_written);
+                                }
+                            }
+
+                            writer.write(&record_batch).map_err(|e| {
+                                LabeledError::new("Failed to write Arrow batch")
+                                    .with_help(e.to_string())
+                            })?;
+
+                            total_written += record_batch.num_rows();
+                        }
+                    }
+                }
+            }
+
+            writer.finish().map_err(|e| {
+                LabeledError::new("Failed to finish Arrow IPC file").with_help(e.to_string())
+            })?;
+
+            return Ok(Value::string(path.to_string_lossy().to_string(), span));
+        }
+
+        let mut values = Vec::new();
+        'streams: for stream in streams {
+            if max_rows.is_some_and(|max| values.len() >= max) {
                 break;
             }
 
-            match response.page_token {
-                Some(pt) => page_token = Some(pt),
-                None => break,
+            let mut req = tonic::Request::new(ReadRowsRequest {
+                read_stream: stream.name,
+                offset: 0,
+            });
+            req.set_timeout(read_timeout);
+
+            let mut row_stream = storage_client
+                .read_rows(req)
+                .await
+                .map_err(|e| {
+                    LabeledError::new("Failed to read rows from BigQuery Storage")
+                        .with_help(format!("gRPC error: {}", e))
+                })?
+                .into_inner();
+
+            while let Some(resp) = row_stream.message().await.map_err(|e| {
+                LabeledError::new("Failed to read rows from BigQuery Storage")
+                    .with_help(format!("gRPC stream error: {}", e))
+            })? {
+                if let Some(Rows::ArrowRecordBatch(batch)) = resp.rows {
+                    for mut record_batch in arrow_decoder.decode_batch(batch.serialized_record_batch)? {
+                        if let Some(max) = max_rows {
+                            if values.len() >= max {
+                                break 'streams;
+                            }
+                            if values.len() + record_batch.num_rows() > max {
+                                record_batch = record_batch.slice(0, max - values.len());
+                            }
+                        }
+
+                        let mut row_values =
+                            crate::arrow_ipc::arrow_batch_to_nu_values(&record_batch, span)?;
+                        values.append(&mut row_values);
+                    }
+                }
             }
         }
 
-        if arrow_mode {
-            let path = arrow_ipc::write_arrow_ipc(&schema, &all_raw_rows)?;
-            Ok(Value::string(path, span))
-        } else {
-            let values = convert::rows_to_values(&schema, &all_raw_rows, span);
-            Ok(Value::list(values, span))
-        }
-    })
-}
-
-struct ReadQueryParams<'a> {
-    client: &'a crate::client::BigQueryClient,
-    dataset_id: &'a str,
-    table_id: &'a str,
-    columns: Option<&'a [String]>,
-    filter: Option<&'a str>,
-    max_results: Option<i64>,
-    arrow_mode: bool,
-    span: nu_protocol::Span,
-}
-
-/// When --filter is used, we convert the read into a SQL query since the
-/// tabledata.list API doesn't support row filtering.
-async fn run_read_via_query(params: ReadQueryParams<'_>) -> Result<Value, LabeledError> {
-    let ReadQueryParams {
-        client,
-        dataset_id,
-        table_id,
-        columns,
-        filter,
-        max_results,
-        arrow_mode,
-        span,
-    } = params;
-    let project = client.project();
-    let select_clause = match columns {
-        Some(cols) if !cols.is_empty() => cols.join(", "),
-        _ => "*".to_string(),
-    };
-
-    let mut sql = format!("SELECT {select_clause} FROM `{project}.{dataset_id}.{table_id}`");
-
-    if let Some(f) = filter {
-        sql.push_str(&format!(" WHERE {f}"));
-    }
-
-    if let Some(limit) = max_results {
-        sql.push_str(&format!(" LIMIT {limit}"));
-    }
-
-    let max_u64 = max_results.map(|n| n as u64);
-    let response = client.query(&sql, None, max_u64, false, None).await?;
-
-    // Reuse the shared pagination + job-polling logic from bq query
-    let (schema, all_raw_rows) =
-        crate::commands::query::collect_all_rows(client, response, None, max_results).await?;
-
-    if arrow_mode {
-        let path = arrow_ipc::write_arrow_ipc(&schema, &all_raw_rows)?;
-        Ok(Value::string(path, span))
-    } else {
-        let values = convert::rows_to_values(&schema, &all_raw_rows, span);
         Ok(Value::list(values, span))
-    }
+    })
 }
 
 #[cfg(test)]

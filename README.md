@@ -13,12 +13,13 @@ A [Nushell](https://www.nushell.sh/) plugin for querying Google BigQuery directl
 
 ## Requirements
 
-- Nushell 0.110.0+
+- Nushell 0.112.2+
 - Rust toolchain (to build from source)
 - Google Cloud credentials (one of):
   - `gcloud auth application-default login` (recommended for development)
   - Service account key JSON file
   - GCE metadata server (on Google Cloud VMs)
+- BigQuery Storage Read permissions for `bq read` (for example, `roles/bigquery.readSessionUser` plus access to the table data)
 
 ## Installation
 
@@ -85,6 +86,8 @@ bq read my_dataset.clickstream --arrow | polars open $in | polars collect
 | `--arrow` | `-a` | Write Arrow IPC file, return path |
 
 Table reference formats: `dataset.table` or `project.dataset.table`
+
+> **Note:** `bq read` utilizes the gRPC-based BigQuery Storage API, which provides significantly faster data transfer speeds, native Arrow IPC streaming, and lower overhead compared to traditional SQL queries.
 
 ### `bq datasets` — List datasets
 

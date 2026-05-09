@@ -1,6 +1,7 @@
+use arrow::array::*;
+use arrow::datatypes::SchemaRef;
 use std::sync::Arc;
 
-use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
@@ -449,6 +450,265 @@ fn json_to_datetime_us(v: &serde_json::Value) -> Option<i64> {
     None
 }
 
+pub(crate) struct StorageArrowDecoder {
+    decoder: arrow::ipc::reader::StreamDecoder,
+    schema: SchemaRef,
+}
+
+impl StorageArrowDecoder {
+    pub(crate) fn new(schema_bytes: Vec<u8>) -> Result<Self, nu_protocol::LabeledError> {
+        let reader = arrow::ipc::reader::StreamReader::try_new(
+            std::io::Cursor::new(schema_bytes.clone()),
+            None,
+        )
+        .map_err(storage_arrow_error)?;
+        let schema = reader.schema();
+
+        let mut decoder = arrow::ipc::reader::StreamDecoder::new();
+        let mut buffer = arrow::buffer::Buffer::from(schema_bytes);
+        let _ = decoder.decode(&mut buffer).map_err(storage_arrow_error)?;
+
+        Ok(Self { decoder, schema })
+    }
+
+    pub(crate) fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    pub(crate) fn decode_batch(
+        &mut self,
+        batch_bytes: Vec<u8>,
+    ) -> Result<Vec<RecordBatch>, nu_protocol::LabeledError> {
+        let mut buffer = arrow::buffer::Buffer::from(batch_bytes);
+        let mut batches = Vec::new();
+
+        while !buffer.is_empty() {
+            if let Some(batch) = self
+                .decoder
+                .decode(&mut buffer)
+                .map_err(storage_arrow_error)?
+            {
+                batches.push(batch);
+            }
+        }
+
+        Ok(batches)
+    }
+}
+
+fn storage_arrow_error(e: arrow::error::ArrowError) -> nu_protocol::LabeledError {
+    nu_protocol::LabeledError::new("Failed to decode Arrow IPC from BigQuery Storage")
+        .with_help(e.to_string())
+}
+
+pub(crate) fn create_arrow_ipc_file_writer(
+    schema: &Schema,
+) -> Result<(FileWriter<std::fs::File>, std::path::PathBuf), nu_protocol::LabeledError> {
+    let temp_file = NamedTempFile::with_suffix(".arrow").map_err(|e| {
+        nu_protocol::LabeledError::new("Failed to create temporary file").with_help(e.to_string())
+    })?;
+    let (file, path) = temp_file.keep().map_err(|e| {
+        nu_protocol::LabeledError::new("Failed to keep temporary file").with_help(e.to_string())
+    })?;
+
+    let writer = FileWriter::try_new(file, schema).map_err(|e| {
+        nu_protocol::LabeledError::new("Failed to create Arrow IPC writer").with_help(e.to_string())
+    })?;
+
+    Ok((writer, path))
+}
+
+pub(crate) fn arrow_batch_to_nu_values(
+    batch: &arrow::record_batch::RecordBatch,
+    span: nu_protocol::Span,
+) -> Result<Vec<nu_protocol::Value>, nu_protocol::LabeledError> {
+    let num_rows = batch.num_rows();
+    let num_cols = batch.num_columns();
+    let schema = batch.schema();
+
+    let mut rows = Vec::with_capacity(num_rows);
+    let mut cols_vals: Vec<Vec<nu_protocol::Value>> = vec![Vec::with_capacity(num_rows); num_cols];
+
+    #[allow(clippy::needless_range_loop)]
+    for c in 0..num_cols {
+        let col = batch.column(c);
+        let field = schema.field(c);
+
+        #[allow(clippy::needless_range_loop)]
+        for r in 0..num_rows {
+            if col.is_null(r) {
+                cols_vals[c].push(nu_protocol::Value::nothing(span));
+                continue;
+            }
+
+            let val = arrow_value_to_nu(col.as_ref(), r, field.data_type(), span);
+            cols_vals[c].push(val);
+        }
+    }
+
+    let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+
+    #[allow(clippy::needless_range_loop)]
+    for r in 0..num_rows {
+        let mut row_record = nu_protocol::Record::with_capacity(num_cols);
+        #[allow(clippy::needless_range_loop)]
+        for c in 0..num_cols {
+            row_record.push(col_names[c].clone(), cols_vals[c][r].clone());
+        }
+        rows.push(nu_protocol::Value::record(row_record, span));
+    }
+
+    Ok(rows)
+}
+
+fn downcast_or_fallback<A: arrow::array::Array + 'static>(
+    col: &dyn arrow::array::Array,
+    row_idx: usize,
+    span: nu_protocol::Span,
+    f: impl FnOnce(&A, usize) -> nu_protocol::Value,
+) -> nu_protocol::Value {
+    col.as_any()
+        .downcast_ref::<A>()
+        .map(|arr| f(arr, row_idx))
+        .unwrap_or_else(|| nu_protocol::Value::string(format!("{:?}", col.data_type()), span))
+}
+
+fn arrow_value_to_nu(
+    col: &dyn arrow::array::Array,
+    row_idx: usize,
+    data_type: &arrow::datatypes::DataType,
+    span: nu_protocol::Span,
+) -> nu_protocol::Value {
+    use arrow::datatypes::DataType;
+
+    if col.is_null(row_idx) {
+        return nu_protocol::Value::nothing(span);
+    }
+
+    match data_type {
+        DataType::Int8 => downcast_or_fallback::<Int8Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::Int16 => downcast_or_fallback::<Int16Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::Int32 => downcast_or_fallback::<Int32Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::Int64 => downcast_or_fallback::<Int64Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i), span)
+        }),
+        DataType::UInt8 => downcast_or_fallback::<UInt8Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::UInt16 => downcast_or_fallback::<UInt16Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::UInt32 => downcast_or_fallback::<UInt32Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::UInt64 => downcast_or_fallback::<UInt64Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::int(arr.value(i) as i64, span)
+        }),
+        DataType::Float32 => downcast_or_fallback::<Float32Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::float(arr.value(i) as f64, span)
+        }),
+        DataType::Float64 => downcast_or_fallback::<Float64Array>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::float(arr.value(i), span)
+        }),
+        DataType::Boolean => downcast_or_fallback::<BooleanArray>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::bool(arr.value(i), span)
+        }),
+        DataType::Utf8 => downcast_or_fallback::<StringArray>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::string(arr.value(i).to_string(), span)
+        }),
+        DataType::LargeUtf8 => {
+            downcast_or_fallback::<LargeStringArray>(col, row_idx, span, |arr, i| {
+                nu_protocol::Value::string(arr.value(i).to_string(), span)
+            })
+        }
+        DataType::Date32 => downcast_or_fallback::<Date32Array>(col, row_idx, span, |arr, i| {
+            let days = arr.value(i) as i64;
+            let seconds = days * 86400;
+            if let Some(dt) = chrono::DateTime::from_timestamp(seconds, 0) {
+                nu_protocol::Value::date(dt.into(), span)
+            } else {
+                nu_protocol::Value::string(format!("Date32({})", days), span)
+            }
+        }),
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _) => {
+            downcast_or_fallback::<TimestampMicrosecondArray>(col, row_idx, span, |arr, i| {
+                let micros = arr.value(i);
+                let seconds = micros / 1_000_000;
+                let nanos = (micros % 1_000_000) * 1000;
+                if let Some(dt) = chrono::DateTime::from_timestamp(seconds, nanos as u32) {
+                    nu_protocol::Value::date(dt.into(), span)
+                } else {
+                    nu_protocol::Value::string(format!("Timestamp(us, {})", micros), span)
+                }
+            })
+        }
+        DataType::List(field) => downcast_or_fallback::<ListArray>(col, row_idx, span, |arr, i| {
+            let values_arr = arr.value(i);
+            let mut items = Vec::with_capacity(values_arr.len());
+            for j in 0..values_arr.len() {
+                items.push(arrow_value_to_nu(
+                    values_arr.as_ref(),
+                    j,
+                    field.data_type(),
+                    span,
+                ));
+            }
+            nu_protocol::Value::list(items, span)
+        }),
+        DataType::LargeList(field) => {
+            downcast_or_fallback::<LargeListArray>(col, row_idx, span, |arr, i| {
+                let values_arr = arr.value(i);
+                let mut items = Vec::with_capacity(values_arr.len());
+                for j in 0..values_arr.len() {
+                    items.push(arrow_value_to_nu(
+                        values_arr.as_ref(),
+                        j,
+                        field.data_type(),
+                        span,
+                    ));
+                }
+                nu_protocol::Value::list(items, span)
+            })
+        }
+        DataType::Struct(fields) => {
+            downcast_or_fallback::<StructArray>(col, row_idx, span, |arr, i| {
+                let mut record = nu_protocol::Record::with_capacity(fields.len());
+                for (j, field) in fields.iter().enumerate() {
+                    let val = arrow_value_to_nu(arr.column(j).as_ref(), i, field.data_type(), span);
+                    record.push(field.name().clone(), val);
+                }
+                nu_protocol::Value::record(record, span)
+            })
+        }
+        DataType::Binary => downcast_or_fallback::<BinaryArray>(col, row_idx, span, |arr, i| {
+            nu_protocol::Value::binary(arr.value(i).to_vec(), span)
+        }),
+        DataType::LargeBinary => {
+            downcast_or_fallback::<LargeBinaryArray>(col, row_idx, span, |arr, i| {
+                nu_protocol::Value::binary(arr.value(i).to_vec(), span)
+            })
+        }
+        // Fallback: cast to string
+        _ => {
+            if let Ok(str_arr) = arrow::compute::cast(col, &DataType::Utf8) {
+                if let Some(arr) = str_arr.as_any().downcast_ref::<StringArray>() {
+                    nu_protocol::Value::string(arr.value(row_idx).to_string(), span)
+                } else {
+                    nu_protocol::Value::string(format!("{:?}", col.data_type()), span)
+                }
+            } else {
+                nu_protocol::Value::string(format!("{:?}", col.data_type()), span)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,6 +1056,221 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(city_col.value(0), "Springfield");
+
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests_arrow_to_nu {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use nu_protocol::{Span, Value};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_arrow_batch_to_nu_values_primitives() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("int_col", DataType::Int64, true),
+            Field::new("float_col", DataType::Float64, true),
+            Field::new("bool_col", DataType::Boolean, true),
+            Field::new("str_col", DataType::Utf8, true),
+        ]));
+
+        let int_arr = Int64Array::from(vec![Some(42), None, Some(-10)]);
+        let float_arr = Float64Array::from(vec![Some(9.99), Some(-2.5), None]);
+        let bool_arr = BooleanArray::from(vec![None, Some(true), Some(false)]);
+        let str_arr = StringArray::from(vec![Some("hello"), Some("world"), None]);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(int_arr),
+                Arc::new(float_arr),
+                Arc::new(bool_arr),
+                Arc::new(str_arr),
+            ],
+        )
+        .unwrap();
+
+        let span = Span::test_data();
+        let result = arrow_batch_to_nu_values(&batch, span).unwrap();
+        assert_eq!(result.len(), 3);
+
+        // Row 0
+        let row0 = result[0].as_record().unwrap();
+        assert_eq!(row0.get("int_col").unwrap(), &Value::int(42, span));
+        assert_eq!(row0.get("float_col").unwrap(), &Value::float(9.99, span));
+        assert_eq!(row0.get("bool_col").unwrap(), &Value::nothing(span));
+        assert_eq!(row0.get("str_col").unwrap(), &Value::string("hello", span));
+
+        // Row 1
+        let row1 = result[1].as_record().unwrap();
+        assert_eq!(row1.get("int_col").unwrap(), &Value::nothing(span));
+        assert_eq!(row1.get("float_col").unwrap(), &Value::float(-2.5, span));
+        assert_eq!(row1.get("bool_col").unwrap(), &Value::bool(true, span));
+        assert_eq!(row1.get("str_col").unwrap(), &Value::string("world", span));
+
+        // Row 2
+        let row2 = result[2].as_record().unwrap();
+        assert_eq!(row2.get("int_col").unwrap(), &Value::int(-10, span));
+        assert_eq!(row2.get("float_col").unwrap(), &Value::nothing(span));
+        assert_eq!(row2.get("bool_col").unwrap(), &Value::bool(false, span));
+        assert_eq!(row2.get("str_col").unwrap(), &Value::nothing(span));
+    }
+
+    #[test]
+    fn test_arrow_batch_to_nu_values_datetime() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("date_col", DataType::Date32, true),
+            Field::new(
+                "ts_col",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+
+        // Date32: days since epoch. 1970-01-02 is 1 day.
+        let date_arr = Date32Array::from(vec![Some(1), None]);
+
+        // Timestamp(us): microseconds since epoch. 1 second is 1_000_000 microseconds.
+        let ts_arr = TimestampMicrosecondArray::from(vec![None, Some(1_000_000)]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(date_arr), Arc::new(ts_arr)]).unwrap();
+
+        let span = Span::test_data();
+        let result = arrow_batch_to_nu_values(&batch, span).unwrap();
+        assert_eq!(result.len(), 2);
+
+        // Row 0
+        let row0 = result[0].as_record().unwrap();
+        match row0.get("date_col").unwrap() {
+            Value::Date { val, .. } => {
+                assert_eq!(val.format("%Y-%m-%d").to_string(), "1970-01-02");
+            }
+            _ => panic!("Expected Date value"),
+        }
+        assert_eq!(row0.get("ts_col").unwrap(), &Value::nothing(span));
+
+        // Row 1
+        let row1 = result[1].as_record().unwrap();
+        assert_eq!(row1.get("date_col").unwrap(), &Value::nothing(span));
+        match row1.get("ts_col").unwrap() {
+            Value::Date { val, .. } => {
+                assert_eq!(
+                    val.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    "1970-01-01 00:00:01"
+                );
+            }
+            _ => panic!("Expected Date value"),
+        }
+    }
+
+    #[test]
+    fn test_arrow_batch_to_nu_values_nested() {
+        use arrow::datatypes::Fields;
+
+        let inner_fields = vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "list_col",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
+            Field::new(
+                "struct_col",
+                DataType::Struct(Fields::from(inner_fields.clone())),
+                true,
+            ),
+        ]));
+
+        let mut list_builder = ListBuilder::new(Int64Builder::new());
+        list_builder.values().append_value(1);
+        list_builder.values().append_value(2);
+        list_builder.append(true);
+        list_builder.append(false);
+        let list_arr = list_builder.finish();
+
+        let a_arr = Arc::new(Int64Array::from(vec![Some(100), Some(200)])) as Arc<dyn Array>;
+        let b_arr = Arc::new(StringArray::from(vec![Some("x"), Some("y")])) as Arc<dyn Array>;
+        let struct_arr =
+            StructArray::try_new(Fields::from(inner_fields), vec![a_arr, b_arr], None).unwrap();
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(list_arr), Arc::new(struct_arr)]).unwrap();
+
+        let span = Span::test_data();
+        let result = arrow_batch_to_nu_values(&batch, span).unwrap();
+        assert_eq!(result.len(), 2);
+
+        let row0 = result[0].as_record().unwrap();
+        let list_val = row0.get("list_col").unwrap().as_list().unwrap();
+        assert_eq!(list_val, &[Value::int(1, span), Value::int(2, span)]);
+
+        let struct_val = row0.get("struct_col").unwrap().as_record().unwrap();
+        assert_eq!(struct_val.get("a").unwrap(), &Value::int(100, span));
+        assert_eq!(struct_val.get("b").unwrap(), &Value::string("x", span));
+    }
+
+    #[test]
+    fn test_storage_arrow_decoder_reads_split_schema_and_batch_messages() {
+        use arrow::ipc::writer::{
+            CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap();
+
+        let options = IpcWriteOptions::default();
+        let mut dictionary_tracker = DictionaryTracker::new(false);
+        let data_gen = IpcDataGenerator::default();
+
+        let schema_message = data_gen.schema_to_bytes_with_dictionary_tracker(
+            schema.as_ref(),
+            &mut dictionary_tracker,
+            &options,
+        );
+        let mut schema_bytes = Vec::new();
+        write_message(&mut schema_bytes, schema_message, &options).unwrap();
+
+        let (_dictionaries, batch_message) = data_gen
+            .encode(
+                &batch,
+                &mut dictionary_tracker,
+                &options,
+                &mut CompressionContext::default(),
+            )
+            .unwrap();
+        let mut batch_bytes = Vec::new();
+        write_message(&mut batch_bytes, batch_message, &options).unwrap();
+
+        let mut decoder = StorageArrowDecoder::new(schema_bytes).unwrap();
+        let decoded = decoder.decode_batch(batch_bytes).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].num_rows(), 2);
+        assert_eq!(decoded[0].schema().field(0).name(), "id");
+    }
+
+    #[test]
+    fn test_create_arrow_ipc_file_writer_allows_empty_file() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let (mut writer, path) = create_arrow_ipc_file_writer(&schema).unwrap();
+        writer.finish().unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let mut reader = arrow::ipc::reader::FileReader::try_new(file, None).unwrap();
+
+        assert_eq!(reader.schema().field(0).name(), "id");
+        assert!(reader.next().is_none());
 
         std::fs::remove_file(&path).ok();
     }
