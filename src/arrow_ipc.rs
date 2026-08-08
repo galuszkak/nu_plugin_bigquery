@@ -1221,7 +1221,7 @@ mod tests_arrow_to_nu {
     #[test]
     fn test_storage_arrow_decoder_reads_split_schema_and_batch_messages() {
         use arrow::ipc::writer::{
-            CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message,
+            DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions, write_message,
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1246,7 +1246,7 @@ mod tests_arrow_to_nu {
                 &batch,
                 &mut dictionary_tracker,
                 &options,
-                &mut CompressionContext::default(),
+                &mut IpcWriteContext::default(),
             )
             .unwrap();
         let mut batch_bytes = Vec::new();
