@@ -132,7 +132,7 @@ fn build_record_batch(
                     .as_ref()
                     .and_then(|cells| cells.get(col_idx))
                     .and_then(|cell| cell.v.as_ref())
-                    .and_then(|v| if v.is_null() { None } else { Some(v) })
+                    .filter(|v| !v.is_null())
             })
             .collect();
 
@@ -226,7 +226,7 @@ fn build_column_array(
                             .and_then(|f| f.as_array())
                             .and_then(|arr| arr.get(child_idx))
                             .and_then(|cell| cell.get("v"))
-                            .and_then(|v| if v.is_null() { None } else { Some(v) })
+                            .filter(|v| !v.is_null())
                     })
                     .collect();
 

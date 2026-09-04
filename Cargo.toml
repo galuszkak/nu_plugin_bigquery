@@ -1,6 +1,6 @@
 [package]
 name = "nu_plugin_bigquery"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "A Nushell plugin for querying Google BigQuery"
 license = "MIT"
@@ -13,8 +13,8 @@ name = "nu_plugin_bigquery"
 path = "src/main.rs"
 
 [dependencies]
-nu-plugin = "0.114.1"
-nu-protocol = "0.114.1"
+nu-plugin = "0.115.1"
+nu-protocol = "0.115.1"
 reqwest = { version = "0.13", features = ["json", "query"] }
 
 # Serialization
@@ -34,8 +34,8 @@ base64 = "0.23"
 arrow = { version = "59", features = ["ipc"] }
 tempfile = "3"
 
-interprocess = "2.4.3"
-google-cloud-auth = "1.15.0"
+interprocess = "2.4.4"
+google-cloud-auth = "1.16.0"
 tonic = { version = "0.14.6", features = ["tls-webpki-roots"] }
 prost = "0.14.4"
 googleapis-tonic-google-cloud-bigquery-storage-v1 = "0.34.0"
