@@ -1,6 +1,6 @@
 [package]
 name = "nu_plugin_bigquery"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "A Nushell plugin for querying Google BigQuery"
 license = "MIT"
@@ -13,8 +13,8 @@ name = "nu_plugin_bigquery"
 path = "src/main.rs"
 
 [dependencies]
-nu-plugin = "0.116.0"
-nu-protocol = "0.116.0"
+nu-plugin = "0.116.1"
+nu-protocol = "0.116.1"
 reqwest = { version = "0.13", features = ["json", "query"] }
 
 # Serialization
